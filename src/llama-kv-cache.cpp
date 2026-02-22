@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_set>
 
 //
 // llama_kv_cache
@@ -30,7 +31,8 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+                     bool   paged) :
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
@@ -211,12 +213,72 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // PagedAttention initialization
+    if (paged) {
+        pa_block_size = 32;
+        GGML_ASSERT(kv_size % pa_block_size == 0 && "kv_size must be a multiple of pa_block_size");
+        const uint32_t n_blocks = kv_size / pa_block_size;
+
+        pa_allocator = std::make_unique<llama_block_allocator>(kv_size, pa_block_size);
+        pa_table     = std::make_unique<llama_block_table>();
+        pa_table->block_size = pa_block_size;
+
+        LLAMA_LOG_INFO("%s: PagedAttention enabled: block_size = %u, n_blocks = %u, capacity = %u cells\n",
+                __func__, pa_block_size, n_blocks, kv_size);
+    }
+}
+
+void llama_kv_cache::cow_copy_block(uint32_t src_block, uint32_t dst_block) const {
+    GGML_ASSERT(pa_block_size > 0);
+    GGML_ASSERT(src_block != dst_block);
+
+    const uint32_t src_cell = src_block * pa_block_size;
+    const uint32_t dst_cell = dst_block * pa_block_size;
+
+    for (const auto & layer : layers) {
+        // Copy K tensor data: shape [n_embd_k_gqa, kv_size, n_stream]
+        // Each cell is one row of size n_embd_k_gqa
+        if (layer.k) {
+            const size_t row_size = ggml_row_size(layer.k->type, layer.k->ne[0]);
+            const size_t block_bytes = row_size * pa_block_size;
+            const size_t src_offset = src_cell * row_size;
+            const size_t dst_offset = dst_cell * row_size;
+
+            std::vector<uint8_t> buf(block_bytes);
+            ggml_backend_tensor_get(layer.k, buf.data(), src_offset, block_bytes);
+            ggml_backend_tensor_set(layer.k, buf.data(), dst_offset, block_bytes);
+        }
+
+        // Copy V tensor data: same structure as K
+        if (layer.v) {
+            const size_t row_size = ggml_row_size(layer.v->type, layer.v->ne[0]);
+            const size_t block_bytes = row_size * pa_block_size;
+            const size_t src_offset = src_cell * row_size;
+            const size_t dst_offset = dst_cell * row_size;
+
+            std::vector<uint8_t> buf(block_bytes);
+            ggml_backend_tensor_get(layer.v, buf.data(), src_offset, block_bytes);
+            ggml_backend_tensor_set(layer.v, buf.data(), dst_offset, block_bytes);
+        }
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
+    }
+
+    // PA: reset block table and reinitialize allocator
+    if (pa_block_size > 0 && pa_allocator && pa_table) {
+        pa_table->tables.clear();
+        // reinitialize free list — all blocks available again
+        pa_allocator->free_list.clear();
+        for (uint32_t i = pa_allocator->num_blocks; i > 0; --i) {
+            pa_allocator->free_list.push_back(i - 1);
+        }
+        std::fill(pa_allocator->ref_count.begin(), pa_allocator->ref_count.end(), 0);
     }
 
     if (data) {
@@ -283,6 +345,22 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             if (new_head != cells.size() && new_head < head) {
                 head = new_head;
             }
+        }
+    }
+
+    // PA: free blocks for the removed position range
+    if (pa_block_size > 0 && pa_allocator && pa_table) {
+        if (seq_id >= 0 && pa_table->has_seq(seq_id)) {
+            if (p0 == 0 && p1 >= std::numeric_limits<llama_pos>::max()) {
+                // full removal — free all blocks for this sequence
+                pa_table->free_seq(seq_id, *pa_allocator);
+            } else {
+                // partial removal — free blocks in [p0, p1) range
+                pa_table->remove_blocks_range(seq_id, (uint32_t) p0, (uint32_t) p1, *pa_allocator);
+            }
+        } else if (seq_id < 0) {
+            // remove all sequences — clear everything
+            pa_table->clear(*pa_allocator);
         }
     }
 
@@ -364,8 +442,14 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             if (shift != 0) {
                 v_cells[s1].pos_add(i, shift);
             }
-
             v_cells[s1].ext_set(i, ext);
+        }
+    }
+
+    // PA: share blocks via CoW when both seqs are in same stream
+    if (pa_block_size > 0 && pa_allocator && pa_table && s0 == s1 && p0 < 0 && p1 < 0) {
+        if (pa_table->has_seq(seq_id_src)) {
+            pa_table->share(seq_id_src, seq_id_dst, *pa_allocator);
         }
     }
 
@@ -395,6 +479,19 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
+    }
+
+    // PA: free blocks for all other sequences
+    if (pa_block_size > 0 && pa_allocator && pa_table) {
+        std::vector<llama_seq_id> to_free;
+        for (auto & [sid, _] : pa_table->tables) {
+            if (sid != seq_id) {
+                to_free.push_back(sid);
+            }
+        }
+        for (auto sid : to_free) {
+            pa_table->free_seq(sid, *pa_allocator);
+        }
     }
 }
 
@@ -573,6 +670,16 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
 
+    // PA: save allocator/table state so we can restore on failure
+    std::vector<uint32_t>                                           pa_free_list_snapshot;
+    std::vector<uint32_t>                                           pa_ref_count_snapshot;
+    std::unordered_map<llama_seq_id, std::vector<uint32_t>>         pa_tables_snapshot;
+    if (pa_block_size > 0 && pa_allocator && pa_table) {
+        pa_free_list_snapshot = pa_allocator->free_list;
+        pa_ref_count_snapshot = pa_allocator->ref_count;
+        pa_tables_snapshot    = pa_table->tables;
+    }
+
     bool success = true;
 
     for (const auto & ubatch : ubatches) {
@@ -619,6 +726,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     }
 
     if (!success) {
+        // PA: restore allocator/table state on failure to prevent block leaks
+        if (pa_block_size > 0 && pa_allocator && pa_table) {
+            pa_allocator->free_list = std::move(pa_free_list_snapshot);
+            pa_allocator->ref_count = std::move(pa_ref_count_snapshot);
+            pa_table->tables        = std::move(pa_tables_snapshot);
+        }
         return {};
     }
 
@@ -788,7 +901,79 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     res.resize(n_seqs);
 
+    // ===== PagedAttention fast path =====
+    // when PA is enabled, use block allocation instead of ring-buffer cell scanning
+    if (pa_block_size > 0 && pa_allocator && pa_table) {
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            const auto seq_id    = ubatch.seq_id_unq[s];
+            const auto stream_id = seq_to_stream[seq_id];
+
+            res.s0 = std::min<uint32_t>(res.s0, stream_id);
+            res.s1 = std::max<uint32_t>(res.s1, stream_id);
+
+            res.strm[s] = stream_id;
+            res.idxs[s].reserve(n_tokens);
+
+            // offset for multi-stream: physical cells for stream s start at s * kv_size
+            const uint32_t stream_offset = stream_id * get_size();
+
+            // track blocks we've already CoW-copied in this find_slot() call
+            std::unordered_set<uint32_t> cow_done;
+
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const uint32_t token_i = s * n_tokens + i;
+                const llama_pos pos    = ubatch.pos[token_i];
+
+                // determine the current total tokens for this seq to know if we need a new block
+                // the position tells us where in the sequence we are
+                const uint32_t pos_u = (uint32_t) pos;
+                if (pa_table->needs_new_block(seq_id, pos_u + 1)) {
+                    if (!pa_allocator->can_allocate(1)) {
+                        LLAMA_LOG_ERROR("%s: PA: no free blocks for seq %d at pos %d\n",
+                                __func__, seq_id, pos);
+                        return { };
+                    }
+                    uint32_t new_block = pa_allocator->allocate();
+                    pa_table->append_block(seq_id, new_block);
+                }
+
+                // CoW write trigger: if this position's block is shared (ref_count > 1),
+                // we must copy the block data to a new block before writing to it.
+                const uint32_t block_id      = pa_table->get_block_id(seq_id, pos);
+                const uint32_t logical_idx   = (uint32_t) pos / pa_block_size;
+
+                if (pa_allocator->ref_count[block_id] > 1 && cow_done.find(block_id) == cow_done.end()) {
+                    if (!pa_allocator->can_allocate(1)) {
+                        LLAMA_LOG_ERROR("%s: PA CoW: no free blocks for seq %d at pos %d\n",
+                                __func__, seq_id, pos);
+                        return { };
+                    }
+                    uint32_t new_block = pa_allocator->allocate();
+                    cow_copy_block(block_id, new_block);
+                    pa_allocator->free_block(block_id);  // decrement old ref
+                    pa_table->replace_block(seq_id, logical_idx, new_block);
+                    cow_done.insert(new_block);
+
+                    LLAMA_LOG_DEBUG("%s: PA CoW: block %u -> %u for seq %d (ref was %u)\n",
+                            __func__, block_id, new_block, seq_id, pa_allocator->ref_count[block_id] + 1);
+                }
+
+                const uint32_t phys_cell = pa_table->logical_to_physical(seq_id, pos);
+                res.idxs[s].push_back(stream_offset + phys_cell);
+            }
+
+            if (res.idxs[s].size() < n_tokens) {
+                return { };
+            }
+        }
+
+        assert(res.s1 >= res.s0);
+        return res;
+    }
+    // ===== end PagedAttention fast path =====
+
     for (uint32_t s = 0; s < n_seqs; ++s) {
+
         const auto seq_id = ubatch.seq_id_unq[s];
 
         if (n_stream > 1) {

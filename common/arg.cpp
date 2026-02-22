@@ -1303,6 +1303,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--kv-cache-paged"},
+        {"--no-kv-cache-paged"},
+        string_format("enable PagedAttention for the KV cache to reduce memory fragmentation (default: %s)", params.kv_cache_paged ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.kv_cache_paged = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CACHE_PAGED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

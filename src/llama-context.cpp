@@ -156,7 +156,8 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
+    cparams.kv_unified      = params.kv_unified;
+    cparams.kv_cache_paged  = params.kv_cache_paged;
 
     // intialized later
     cparams.pipeline_parallel = false;
@@ -268,9 +269,10 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
+            /*.type_k          =*/ params.type_k,
+            /*.type_v          =*/ params.type_v,
+            /*.swa_full        =*/ params.swa_full,
+            /*.kv_cache_paged  =*/ cparams.kv_cache_paged,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -2921,6 +2923,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_cache_paged              =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };

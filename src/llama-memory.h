@@ -20,6 +20,9 @@ struct llama_memory_params {
 
     // use full-size SWA cache
     bool swa_full;
+
+    // enable PagedAttention
+    bool kv_cache_paged;
 };
 
 enum llama_memory_status {

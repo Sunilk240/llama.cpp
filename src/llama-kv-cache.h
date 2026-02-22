@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-memory.h"
 
 #include <unordered_map>
@@ -106,7 +107,8 @@ public:
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+                         bool   paged = false);
 
     ~llama_kv_cache() = default;
 
@@ -251,6 +253,17 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // PagedAttention state (pa_block_size == 0 means PA is disabled)
+    // mutable because find_slot() is const but PA needs to allocate blocks during slot finding.
+    // prepare() handles rollback by saving/restoring PA state alongside cell state.
+    uint32_t pa_block_size = 0;
+    mutable std::unique_ptr<llama_block_allocator> pa_allocator;
+    mutable std::unique_ptr<llama_block_table>     pa_table;
+
+    // CoW helper: copy KV tensor data from one physical block to another across all layers.
+    // Called from find_slot() when writing to a shared block (ref_count > 1).
+    void cow_copy_block(uint32_t src_block, uint32_t dst_block) const;
 
     size_t total_size() const;
 
