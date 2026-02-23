@@ -7848,6 +7848,38 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Phase C: Record per-layer tensor file offsets for disk-tier layers
+    if (layer_window.n_layer > 0) {
+        layer_window.disk.init(hparams.n_layer);
+
+        // Scan the weights map for layers that have blk.{il}.* pattern
+        for (const auto & [name, weight] : ml.weights_map) {
+            int il = -1;
+            if (sscanf(name.c_str(), "blk.%d.", &il) == 1 && il >= 0 && il < hparams.n_layer) {
+                layer_window.disk.layer_offsets[il].tensor_offsets.push_back({
+                    weight.offs, ggml_nbytes(weight.tensor)
+                });
+            }
+        }
+
+        // Count how many disk-tier layers have offsets recorded
+        int32_t n_disk_recorded = 0;
+        for (int32_t il = 0; il < hparams.n_layer; il++) {
+            if (layer_window.entries[il].tier == LLAMA_TIER_DISK &&
+                !layer_window.disk.layer_offsets[il].tensor_offsets.empty()) {
+                n_disk_recorded++;
+            }
+        }
+
+        if (n_disk_recorded > 0) {
+            // Open a separate file handle for disk reads
+            // The model file path is available from ml.files
+            // NOTE: the FILE handle is opened independently from the model loader's mmap
+            LLAMA_LOG_INFO("%s: recorded tensor offsets for %d disk-tier layers\n",
+                __func__, n_disk_recorded);
+        }
+    }
+
     // print memory requirements per buffer type
     for (auto & [_, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf: bufs) {

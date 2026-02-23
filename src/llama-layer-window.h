@@ -7,6 +7,9 @@
 #include <cstddef>
 #include <vector>
 #include <utility>
+#include <mutex>
+#include <thread>
+#include <cstdio>
 
 struct llama_hparams;
 struct llama_model;
@@ -112,7 +115,45 @@ struct llama_layer_window {
     void swap_layer_to_gpu(int32_t il, struct llama_layer & layer);
     void swap_layer_to_cpu(int32_t il, struct llama_layer & layer);
 
-    // Cleanup (frees pinned memory and GPU staging buffers)
+    // Phase C: 3-tier auto-detection (GPU → CPU → Disk)
+    void auto_detect_tiers(
+        const std::vector<ggml_backend_dev_t> & devices,
+        size_t cpu_available
+    );
+
+    // Phase C: Disk I/O pipeline
+    struct disk_io {
+        std::thread io_thread;
+        std::mutex  mtx;
+        bool        stop = false;
+
+        // GGUF file handle for direct disk reads
+        FILE * model_file = nullptr;
+
+        // Per-layer file offsets (populated during model load)
+        struct layer_offset {
+            std::vector<std::pair<size_t, size_t>> tensor_offsets;  // (file_offset, size)
+        };
+        std::vector<layer_offset> layer_offsets;
+
+        // CPU-resident LRU cache for disk-tier layers
+        struct cpu_cache_entry {
+            int32_t  il        = -1;
+            void *   data      = nullptr;
+            size_t   size      = 0;
+            uint64_t last_access = 0;
+        };
+        std::vector<cpu_cache_entry> cpu_cache;
+        size_t cpu_cache_budget = 0;  // max bytes for CPU cache
+        uint64_t access_counter = 0;  // monotonic counter for LRU ordering
+
+        void init(int32_t n_layer);
+        void load_layer_from_disk(int32_t il, void * dst);
+        void evict_lru();
+        void free_cache();
+    } disk;
+
+    // Cleanup (frees pinned memory, GPU staging buffers, and disk cache)
     void free();
 
     // Is windowing active?

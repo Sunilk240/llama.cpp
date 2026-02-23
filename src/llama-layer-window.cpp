@@ -6,6 +6,12 @@
 #include <cstdlib>
 #include <cstring>
 
+#ifdef _WIN32
+#include <io.h>      // _fseeki64
+#else
+#include <unistd.h>  // pread
+#endif
+
 //
 // Helper: iterate all non-null ggml_tensor* fields in a llama_layer.
 //
@@ -118,6 +124,8 @@ void llama_layer_window::free() {
             staging[i].pinned = false;
         }
     }
+    // Phase C: clean up disk cache
+    disk.free_cache();
     entries.clear();
     n_layer  = 0;
     n_window = 0;
@@ -241,4 +249,131 @@ void llama_layer_window::swap_layer_to_cpu(int32_t il, struct llama_layer & laye
     entry.staging_slot = -1;
 
     GGML_UNUSED(layer);
+}
+
+// ---- Phase C: Disk I/O implementation ----
+
+void llama_layer_window::disk_io::init(int32_t n_layer) {
+    layer_offsets.resize(n_layer);
+    access_counter = 0;
+}
+
+void llama_layer_window::disk_io::load_layer_from_disk(int32_t il, void * dst) {
+    if (!model_file || il < 0 || il >= (int32_t)layer_offsets.size()) {
+        LLAMA_LOG_ERROR("%s: invalid layer %d or no file handle\n", __func__, il);
+        return;
+    }
+
+    const auto & offsets = layer_offsets[il];
+    size_t write_offset = 0;
+
+    for (const auto & [file_off, size] : offsets.tensor_offsets) {
+#ifdef _WIN32
+        _fseeki64(model_file, (__int64)file_off, SEEK_SET);
+        size_t read = fread((char *)dst + write_offset, 1, size, model_file);
+        if (read != size) {
+            LLAMA_LOG_ERROR("%s: short read for layer %d: expected %zu, got %zu\n",
+                __func__, il, size, read);
+        }
+#else
+        ssize_t read = pread(fileno(model_file), (char *)dst + write_offset, size, file_off);
+        if (read < 0 || (size_t)read != size) {
+            LLAMA_LOG_ERROR("%s: pread failed for layer %d: expected %zu, got %zd\n",
+                __func__, il, size, read);
+        }
+#endif
+        write_offset += size;
+    }
+}
+
+void llama_layer_window::disk_io::evict_lru() {
+    if (cpu_cache.empty()) return;
+
+    // Sort by last_access ascending (oldest first)
+    std::sort(cpu_cache.begin(), cpu_cache.end(),
+        [](const cpu_cache_entry & a, const cpu_cache_entry & b) {
+            return a.last_access < b.last_access;
+        });
+
+    // Compute total cache usage
+    size_t total = 0;
+    for (const auto & e : cpu_cache) total += e.size;
+
+    // Evict oldest entries until under budget
+    while (total > cpu_cache_budget && !cpu_cache.empty()) {
+        auto & oldest = cpu_cache.front();
+        total -= oldest.size;
+        ::free(oldest.data);
+        LLAMA_LOG_DEBUG("%s: evicted layer %d (%.1f MiB), total now %.1f MiB\n",
+            __func__, oldest.il,
+            oldest.size / (1024.0 * 1024.0),
+            total / (1024.0 * 1024.0));
+        cpu_cache.erase(cpu_cache.begin());
+    }
+}
+
+void llama_layer_window::disk_io::free_cache() {
+    for (auto & e : cpu_cache) {
+        if (e.data) {
+            ::free(e.data);
+            e.data = nullptr;
+        }
+    }
+    cpu_cache.clear();
+    layer_offsets.clear();
+
+    if (model_file) {
+        fclose(model_file);
+        model_file = nullptr;
+    }
+
+    stop = true;
+    if (io_thread.joinable()) {
+        io_thread.join();
+    }
+}
+
+// ---- Phase C: 3-tier auto-detection ----
+
+static constexpr size_t TIER_SAFETY_MARGIN = 256ULL << 20;  // 256 MiB
+
+void llama_layer_window::auto_detect_tiers(
+        const std::vector<ggml_backend_dev_t> & devices,
+        size_t cpu_available) {
+    // Query GPU free memory
+    size_t gpu_free = 0;
+    for (auto * dev : devices) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+            ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            size_t free_dev = 0, total_dev = 0;
+            ggml_backend_dev_memory(dev, &free_dev, &total_dev);
+            gpu_free += free_dev;
+        }
+    }
+
+    size_t gpu_budget = (gpu_free > TIER_SAFETY_MARGIN) ? gpu_free - TIER_SAFETY_MARGIN : 0;
+    size_t cpu_budget = (cpu_available > TIER_SAFETY_MARGIN) ? cpu_available - TIER_SAFETY_MARGIN : 0;
+
+    n_gpu_static = 0;
+    int32_t n_cpu  = 0;
+    int32_t n_disk = 0;
+
+    // Assign layers from the end (output layers benefit most from GPU)
+    for (int il = n_layer - 1; il >= 0; il--) {
+        if (entries[il].weight_bytes <= gpu_budget) {
+            entries[il].tier = LLAMA_TIER_GPU;
+            gpu_budget -= entries[il].weight_bytes;
+            n_gpu_static++;
+        } else if (entries[il].weight_bytes <= cpu_budget) {
+            entries[il].tier = LLAMA_TIER_CPU;
+            cpu_budget -= entries[il].weight_bytes;
+            n_cpu++;
+        } else {
+            entries[il].tier = LLAMA_TIER_DISK;
+            n_disk++;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: tier assignment: %d GPU, %d CPU, %d Disk\n",
+        __func__, n_gpu_static, n_cpu, n_disk);
 }
