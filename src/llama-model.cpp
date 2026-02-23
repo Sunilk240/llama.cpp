@@ -477,6 +477,8 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    // Free pinned memory and GPU staging buffers (Phase B)
+    layer_window.free();
 }
 
 void llama_model::load_stats(llama_model_loader & ml) {
@@ -7780,6 +7782,72 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
 
+    // Phase B: Initialize layer window manager
+    {
+        const int32_t layer_window_param = params.layer_window;
+
+        if (layer_window_param != 0) {
+            layer_window.init(hparams.n_layer);
+            layer_window.compute_layer_sizes(*this);
+
+            // Assign tiers: layers offloaded to GPU are GPU-static, rest are CPU-tier
+            const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
+            const int n_cpu_start = hparams.n_layer - n_gpu;  // first n layers are CPU
+
+            layer_window.n_gpu_static = n_gpu;
+            for (int32_t il = 0; il < hparams.n_layer; il++) {
+                layer_window.entries[il].tier = (il >= n_cpu_start) ? LLAMA_TIER_GPU : LLAMA_TIER_CPU;
+            }
+
+            // Determine window size
+            if (layer_window_param == -1) {
+                // Auto-detect: query free VRAM from first GPU device
+                size_t free_vram = 0;
+                for (auto * dev : devices) {
+                    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                        size_t free_dev = 0, total_dev = 0;
+                        ggml_backend_dev_memory(dev, &free_dev, &total_dev);
+                        free_vram += free_dev;
+                    }
+                }
+
+                // Estimate KV cache and activation sizes
+                const size_t kv_est = std::min((uint32_t)4096, hparams.n_ctx_train)
+                    * (uint64_t)(hparams.n_embd_k_gqa() + hparams.n_embd_v_gqa())
+                    * sizeof(ggml_fp16_t) * hparams.n_layer;
+                const size_t act_est = hparams.n_embd * 512ULL * sizeof(float) * 4;
+
+                layer_window.auto_detect_window(free_vram, kv_est, act_est);
+            } else {
+                layer_window.n_window = layer_window_param;
+            }
+
+            // Allocate staging buffers if windowing is active
+            if (layer_window.enabled()) {
+                // Use first GPU backend for staging allocations
+                ggml_backend_t gpu_backend = nullptr;
+                for (auto * dev : devices) {
+                    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                        gpu_backend = ggml_backend_dev_init(dev, nullptr);
+                        break;
+                    }
+                }
+                if (gpu_backend) {
+                    layer_window.allocate_staging_buffers(gpu_backend);
+                } else {
+                    LLAMA_LOG_WARN("%s: layer window enabled but no GPU backend found, disabling\n", __func__);
+                    layer_window.n_window = 0;
+                }
+            }
+
+            LLAMA_LOG_INFO("%s: layer window: %d layers (gpu_static=%d, cpu=%d)\n",
+                __func__, layer_window.n_window, layer_window.n_gpu_static,
+                hparams.n_layer - layer_window.n_gpu_static);
+        }
+    }
+
     // print memory requirements per buffer type
     for (auto & [_, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf: bufs) {
@@ -8835,6 +8903,8 @@ llama_model_params llama_model_default_params() {
         /*.devices                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
+        /*.layer_window                =*/ 0,
+        /*.layer_prefetch              =*/ true,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,

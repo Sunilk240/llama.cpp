@@ -1121,11 +1121,46 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // Phase B: swap CPU-tier layers into GPU staging before compute
+    if (model.layer_window.enabled()) {
+        auto & lw = const_cast<llama_layer_window &>(model.layer_window);
+        const int32_t n_layer = model.hparams.n_layer;
+
+        // Determine which layers are needed for this ubatch
+        // For now, swap the entire window centered on the middle layer
+        const int32_t mid_layer = n_layer / 2;  // TODO: determine from graph analysis
+        auto [win_start, win_end] = lw.get_window_range(mid_layer);
+
+        // Swap needed layers to GPU
+        for (int32_t il = win_start; il < win_end; il++) {
+            if (lw.entries[il].tier == LLAMA_TIER_CPU && lw.entries[il].staging_slot < 0) {
+                lw.swap_layer_to_gpu(il, const_cast<llama_layer &>(model.layers[il]));
+
+                // Copy data from CPU to GPU staging
+                for (const auto & sp : lw.entries[il].saved_ptrs) {
+                    ggml_backend_tensor_set(sp.tensor, sp.orig_data, 0, ggml_nbytes(sp.tensor));
+                }
+            }
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // Phase B: swap layers back to CPU after compute
+    if (model.layer_window.enabled()) {
+        auto & lw = const_cast<llama_layer_window &>(model.layer_window);
+        const int32_t n_layer = model.hparams.n_layer;
+
+        for (int32_t il = 0; il < n_layer; il++) {
+            if (lw.entries[il].staging_slot >= 0) {
+                lw.swap_layer_to_cpu(il, const_cast<llama_layer &>(model.layers[il]));
+            }
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;

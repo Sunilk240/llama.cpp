@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
+#include "llama-layer-window.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
@@ -488,6 +489,9 @@ struct llama_model {
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
     std::vector<llama_layer> layers;
+
+    // layer window manager for prefetched layer offloading (Phase B)
+    llama_layer_window layer_window;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see

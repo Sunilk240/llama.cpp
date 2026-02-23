@@ -1450,10 +1450,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // Phase A: async prefetch tracking
+    // When we finish copying inputs for split N, we start async-copying inputs for split N+1
+    // while split N's graph compute runs on the GPU. This overlaps transfer with compute.
+    bool has_pending_prefetch = false;
+    int  prefetch_backend_id  = -1;  // which backend has the pending prefetch
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        // Phase A: if there was an async prefetch for THIS split, wait via event
+        // We use the existing sched->events infrastructure (see ggml_backend_sched_new)
+        // rather than raw ggml_backend_synchronize, to allow fine-grained overlap
+        if (has_pending_prefetch && prefetch_backend_id >= 0) {
+            if (sched->events[prefetch_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_wait(split_backend, sched->events[prefetch_backend_id][sched->cur_copy]);
+            } else {
+                // Fallback: no events available, synchronize the whole backend
+                ggml_backend_synchronize(split_backend);
+            }
+            has_pending_prefetch = false;
+            prefetch_backend_id = -1;
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1575,6 +1595,52 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
+            }
+        }
+
+        // Phase A: prefetch NEXT split's inputs asynchronously
+        // While this split's graph computes on GPU, we start copying the next split's
+        // inputs in the background. This overlaps CPU->GPU transfer with GPU compute.
+        if (split_id + 1 < sched->n_splits) {
+            struct ggml_backend_sched_split * next_split = &splits[split_id + 1];
+            int next_backend_id = next_split->backend_id;
+            ggml_backend_t next_backend = sched->backends[next_backend_id];
+
+            for (int next_input_id = 0; next_input_id < next_split->n_inputs; next_input_id++) {
+                struct ggml_tensor * next_input = next_split->inputs[next_input_id];
+
+                // Skip user inputs - they MUST be copied synchronously at the start of
+                // the next iteration (the user may overwrite the data between batches)
+                if (next_input->flags & GGML_TENSOR_FLAG_INPUT) {
+                    continue;
+                }
+
+                // Skip if already on the target backend (no copy needed)
+                ggml_backend_t next_input_backend = ggml_backend_sched_get_tensor_backend(sched, next_input);
+                if (next_input_backend == next_backend) {
+                    continue;
+                }
+
+                // Skip MoE expert weights - they have their own sparse copy optimization
+                // (L1480-L1564) that copies only active experts. Prefetching all experts
+                // would waste bandwidth.
+                if (next_split->graph.n_nodes > 0) {
+                    ggml_tensor * next_node = next_split->graph.nodes[0];
+                    if (ggml_backend_buffer_get_usage(next_input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                        next_node->op == GGML_OP_MUL_MAT_ID) {
+                        continue;
+                    }
+                }
+
+                // Attempt async copy (CPU->GPU via the backend's cpy_tensor_async interface)
+                struct ggml_tensor * next_input_cpy = tensor_copy(next_input, next_backend_id, sched->cur_copy);
+                if (next_backend->iface.cpy_tensor_async &&
+                    next_backend->iface.cpy_tensor_async(next_input_backend, next_backend, next_input, next_input_cpy)) {
+                    has_pending_prefetch = true;
+                    prefetch_backend_id = next_backend_id;
+                    // Successfully started async copy - it will complete while graph computes
+                }
+                // If async fails, the normal sync path in the next iteration will handle it
             }
         }
 

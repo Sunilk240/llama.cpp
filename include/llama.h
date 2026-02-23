@@ -287,6 +287,8 @@ extern "C" {
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
+        int32_t layer_window; // number of CPU layers to window into GPU staging (0=disabled, -1=auto)
+        bool    layer_prefetch; // enable async prefetching of windowed layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE

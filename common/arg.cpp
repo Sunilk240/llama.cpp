@@ -2339,6 +2339,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
+        {"--layer-window"}, "N",
+        "number of CPU-offloaded layers to window into GPU staging, 'auto' or exact number (default: 0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.layer_window = -1;
+            } else {
+                params.layer_window = std::stoi(value);
+            }
+        }
+    ).set_env("LLAMA_ARG_LAYER_WINDOW"));
+    add_opt(common_arg(
+        {"--no-layer-prefetch"},
+        "disable async prefetching for layer window (default: enabled)",
+        [](common_params & params) {
+            params.layer_prefetch = false;
+        }
+    ));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
