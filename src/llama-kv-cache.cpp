@@ -634,7 +634,18 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         auto sinfos = prepare(ubatches);
         if (sinfos.empty()) {
-            break;
+            // Try smart eviction before giving up
+            if (eviction_mode != KV_EVICT_NONE) {
+                const int32_t needed = (int32_t)ubatches.size();
+                const int32_t freed = evict_cells(std::max(needed, 32));
+                if (freed > 0) {
+                    LLAMA_LOG_DEBUG("%s: evicted %d cells, retrying prepare\n", __func__, freed);
+                    sinfos = prepare(ubatches);
+                }
+            }
+            if (sinfos.empty()) {
+                break;
+            }
         }
 
         return std::make_unique<llama_kv_cache_context>(
@@ -1156,6 +1167,148 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    // Phase 2: Update eviction scores for cells that were just written to
+    if (eviction_mode == KV_EVICT_SCORED && !eviction_scores.empty()) {
+        eviction_step++;
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const auto stream_id = sinfo.strm[s];
+            if (stream_id < eviction_scores.size()) {
+                auto & scores = eviction_scores[stream_id];
+                for (const auto idx : sinfo.idxs[s]) {
+                    if (idx < scores.size()) {
+                        scores[idx] = eviction_step; // timestamp = last access
+                    }
+                }
+            }
+        }
+    }
+}
+
+void llama_kv_cache::set_eviction_policy(int32_t mode, int32_t sink, int32_t protect) {
+    // [FIX #5] Validate inputs before applying
+    if (sink < 0 || sink > 256) {
+        LLAMA_LOG_ERROR("%s: invalid n_sink=%d, must be 0-256\n", __func__, sink);
+        return;
+    }
+    if (protect < 0 || protect > (int32_t)get_size()) {
+        LLAMA_LOG_ERROR("%s: invalid n_protected=%d, must be 0-%d\n",
+            __func__, protect, get_size());
+        return;
+    }
+    if (protect > 0 && protect < sink) {
+        LLAMA_LOG_WARN("%s: n_protected=%d < n_sink=%d, adjusting to n_sink\n",
+            __func__, protect, sink);
+        protect = sink;
+    }
+
+    eviction_mode = static_cast<kv_eviction_mode>(mode);
+    n_sink = sink;
+    n_protected = protect;
+
+    if (eviction_mode == KV_EVICT_SCORED) {
+        eviction_scores.resize(v_cells.size());
+        for (uint32_t s = 0; s < v_cells.size(); ++s) {
+            eviction_scores[s].resize(v_cells[s].size(), 0);
+        }
+    }
+
+    if (eviction_mode != KV_EVICT_NONE) {
+        LLAMA_LOG_INFO("%s: eviction policy=%d, sinks=%d, protected=%d\n",
+            __func__, (int)eviction_mode, n_sink, n_protected);
+    }
+}
+
+int32_t llama_kv_cache::evict_cells(int32_t n_to_evict) {
+    if (eviction_mode == KV_EVICT_NONE || n_to_evict <= 0) {
+        return 0;
+    }
+
+    int32_t n_evicted = 0;
+
+    for (uint32_t si = 0; si < v_cells.size(); ++si) {
+        auto & cells = v_cells[si];
+
+        // Build candidate list: all non-empty cells that are NOT protected
+        struct evict_candidate {
+            uint32_t idx;
+            llama_pos pos;
+            uint64_t  score; // lower = evict first
+        };
+
+        std::vector<evict_candidate> candidates;
+        candidates.reserve(cells.get_used());
+
+        for (uint32_t idx = cells.used_min(); idx < cells.used_max_p1(); ++idx) {
+            if (cells.is_empty(idx)) continue;
+            const llama_pos pos = cells.pos_get(idx);
+
+            // [FIX #4] Never evict cells shared by multiple sequences (seq_cp'd)
+            if (cells.seq_count(idx) > 1) continue;
+
+            // Never evict sink tokens (first n_sink positions)
+            if (pos < n_sink) continue;
+
+            // Never evict protected range (e.g. system prompt)
+            if (pos < n_protected) continue;
+
+            // [FIX #8] Per-sequence recent window calculation
+            if (cells.seq_count(idx) == 1) {
+                const auto seq_id = cells.seq_get(idx);
+                const llama_pos seq_max = cells.seq_pos_max(seq_id);
+                const llama_pos seq_min = cells.seq_pos_min(seq_id);
+                const llama_pos seq_len = seq_max - seq_min + 1;
+                const llama_pos recent_window = std::max((llama_pos)32, seq_len / 4);
+                if (pos > seq_max - recent_window) continue;
+            }
+
+            uint64_t score = 0;
+            if (eviction_mode == KV_EVICT_SCORED && !eviction_scores.empty()) {
+                // Scored mode: use access frequency with decay
+                score = eviction_scores[si][idx];
+            } else {
+                // Streaming mode: score = position (evict oldest middle tokens)
+                score = (uint64_t)pos;
+            }
+
+            candidates.push_back({idx, pos, score});
+        }
+
+        if (candidates.empty()) continue;
+
+        // Sort by score ascending (lowest score = evict first)
+        std::sort(candidates.begin(), candidates.end(),
+            [](const evict_candidate & a, const evict_candidate & b) {
+                return a.score < b.score;
+            });
+
+        // Evict up to n_to_evict candidates
+        // Note: evicts from all sequences in a stream proportionally to their size
+        const int32_t n = std::min((int32_t)candidates.size(), n_to_evict - n_evicted);
+        for (int32_t i = 0; i < n; ++i) {
+            const uint32_t idx = candidates[i].idx;
+
+            // Remove all sequences from this cell.
+            // Note: seq_rm() returns true and fully clears the cell when the
+            // last sequence is removed, so no separate rm() call is needed.
+            while (!cells.is_empty(idx)) {
+                const auto seq_id = cells.seq_get(idx);
+                cells.seq_rm(idx, seq_id);
+            }
+            n_evicted++;
+        }
+    }
+
+    // [FIX #7] Single log line with total eviction count
+    if (n_evicted > 0) {
+        LLAMA_LOG_INFO("%s: evicted %d cells (mode=%d)\n",
+                __func__, n_evicted, (int)eviction_mode);
+    } else {
+        // [FIX #11] Log when no candidates were found (helps debugging)
+        LLAMA_LOG_DEBUG("%s: no evictable cells found (all protected/recent/shared)\n", __func__);
+    }
+
+    return n_evicted;
 }
 
 bool llama_kv_cache::get_can_shift() const {

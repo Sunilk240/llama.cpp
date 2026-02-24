@@ -361,6 +361,11 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        // Smart KV eviction: 0=none, 1=streaming (StreamingLLM), 2=scored (access-frequency)
+        int32_t kv_eviction_mode;     // default: 0 (disabled)
+        int32_t kv_sink_tokens;       // number of initial tokens to always keep (default: 4)
+        int32_t kv_protected_tokens;  // number of positions to protect from eviction (default: 0)
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU

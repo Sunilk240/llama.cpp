@@ -1311,6 +1311,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_CACHE_PAGED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--kv-eviction"}, "MODE",
+        string_format("KV cache eviction mode: 0=none, 1=streaming, 2=scored (default: %d)", params.kv_eviction_mode),
+        [](common_params & params, const std::string & value) {
+            params.kv_eviction_mode = std::stoi(value);
+            if (params.kv_eviction_mode < 0 || params.kv_eviction_mode > 2) {
+                throw std::invalid_argument("invalid kv-eviction mode, must be 0-2");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-sink-tokens"}, "N",
+        string_format("number of initial sink tokens to keep during eviction (default: %d)", params.kv_sink_tokens),
+        [](common_params & params, const std::string & value) {
+            params.kv_sink_tokens = std::stoi(value);
+            if (params.kv_sink_tokens < 0 || params.kv_sink_tokens > 256) {
+                throw std::invalid_argument("invalid kv-sink-tokens, must be 0-256");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-protected-tokens"}, "N",
+        string_format("number of positions to protect from eviction (default: %d)", params.kv_protected_tokens),
+        [](common_params & params, const std::string & value) {
+            params.kv_protected_tokens = std::stoi(value);
+            if (params.kv_protected_tokens < 0) {
+                throw std::invalid_argument("invalid kv-protected-tokens, must be >= 0");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

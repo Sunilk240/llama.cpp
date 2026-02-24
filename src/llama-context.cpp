@@ -7,6 +7,8 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -276,6 +278,28 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // Configure KV eviction policy (Feature 3)
+        // [FIX #1] Handle both single KV cache and ISWA dual-cache
+        if (params.kv_eviction_mode > 0) {
+            if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                kv->set_eviction_policy(
+                    params.kv_eviction_mode,
+                    params.kv_sink_tokens,
+                    params.kv_protected_tokens
+                );
+            } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+                // [FIX #12] SWA cache is sized for sliding window only (n_swa tokens)
+                // It doesn't need smart eviction — only the base cache does
+                if (auto * base = iswa->get_base()) {
+                    base->set_eviction_policy(
+                        params.kv_eviction_mode,
+                        params.kv_sink_tokens,
+                        params.kv_protected_tokens
+                    );
+                }
+            }
+        }
     }
 
     // init backends
@@ -2952,6 +2976,9 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.kv_eviction_mode            =*/ 0,
+        /*.kv_sink_tokens              =*/ 4,
+        /*.kv_protected_tokens         =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

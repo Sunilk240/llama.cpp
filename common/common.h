@@ -387,6 +387,11 @@ struct common_params {
     bool    fit_params         = true; // whether to fit unset model/context parameters to free device memory
     int32_t fit_params_min_ctx = 4096; // minimum context size to set when trying to reduce memory use
 
+    // KV cache eviction params
+    int32_t kv_eviction_mode    = 0; // 0=none, 1=streaming, 2=scored
+    int32_t kv_sink_tokens      = 4; // initial positions to always keep
+    int32_t kv_protected_tokens = 0; // positions to protect from eviction
+
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 

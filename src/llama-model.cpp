@@ -7795,7 +7795,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             const int n_cpu_start = hparams.n_layer - n_gpu;  // first n layers are CPU
 
             layer_window.n_gpu_static = n_gpu;
-            for (int32_t il = 0; il < hparams.n_layer; il++) {
+            for (uint32_t il = 0; il < hparams.n_layer; il++) {
                 layer_window.entries[il].tier = (il >= n_cpu_start) ? LLAMA_TIER_GPU : LLAMA_TIER_CPU;
             }
 
@@ -7854,8 +7854,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         // Scan the weights map for layers that have blk.{il}.* pattern
         for (const auto & [name, weight] : ml.weights_map) {
-            int il = -1;
-            if (sscanf(name.c_str(), "blk.%d.", &il) == 1 && il >= 0 && il < hparams.n_layer) {
+            unsigned int il = 0;
+            if (sscanf(name.c_str(), "blk.%u.", &il) == 1 && il < hparams.n_layer) {
                 layer_window.disk.layer_offsets[il].tensor_offsets.push_back({
                     weight.offs, ggml_nbytes(weight.tensor)
                 });
@@ -7864,7 +7864,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         // Count how many disk-tier layers have offsets recorded
         int32_t n_disk_recorded = 0;
-        for (int32_t il = 0; il < hparams.n_layer; il++) {
+        for (uint32_t il = 0; il < hparams.n_layer; il++) {
             if (layer_window.entries[il].tier == LLAMA_TIER_DISK &&
                 !layer_window.disk.layer_offsets[il].tensor_offsets.empty()) {
                 n_disk_recorded++;

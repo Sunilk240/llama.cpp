@@ -154,6 +154,9 @@ public:
 
     bool get_has_shift() const;
 
+    // configure smart KV eviction policy
+    void set_eviction_policy(int32_t mode, int32_t sink, int32_t protect);
+
     //
     // graph_build API
     //
@@ -185,6 +188,10 @@ public:
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+
+    // evict cells using the configured eviction policy
+    // returns number of cells evicted, 0 if eviction is disabled
+    int32_t evict_cells(int32_t n_to_evict);
 
     //
     // input API
@@ -233,6 +240,21 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+
+    // Smart KV eviction policy (Feature 3)
+    enum kv_eviction_mode {
+        KV_EVICT_NONE      = 0, // disabled — use context shift (default)
+        KV_EVICT_STREAMING = 1, // StreamingLLM: keep sink + recent window
+        KV_EVICT_SCORED    = 2, // StreamingLLM + access-frequency scoring
+    };
+
+    kv_eviction_mode eviction_mode = KV_EVICT_NONE;
+    int32_t n_sink      = 4; // number of initial tokens to always keep
+    int32_t n_protected = 0; // number of positions to protect (e.g. system prompt)
+
+    // per-cell access counters (only allocated when eviction_mode == KV_EVICT_SCORED)
+    std::vector<std::vector<uint64_t>> eviction_scores;
+    uint64_t eviction_step = 0; // monotonic counter for decay
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
